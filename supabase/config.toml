@@ -1,0 +1,12 @@
+[api]
+enabled = true
+port = 54321
+
+[db]
+port = 54322
+
+[functions.market-cron-slow]
+execution_timeout = 25
+
+[functions.market-cron-fast]
+execution_timeout = 25

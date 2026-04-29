@@ -1,0 +1,192 @@
+================================================================
+  TRADEGHOST — UPDATED ERROR REPORT & FIX SUMMARY
+  Updated: April 27, 2026
+================================================================
+
+----------------------------------------------------------------
+SECTION 1: ARCHITECTURE OVERVIEW
+----------------------------------------------------------------
+
+Project      : TradeGhost
+Framework    : Next.js 14.2.35, App Router, React 18.3.1
+Hosting      : Netlify (frontend + API routes)
+Backend      : Supabase (PostgreSQL, Auth, Edge Functions, Realtime)
+Media        : ImageKit
+UI           : Tailwind CSS, shadcn/ui, Radix UI, lucide-react
+
+Market Data Architecture:
+  market-cron-fast  (every 1 min)  → Crypto + Forex
+  market-cron-slow  (every 5 min)  → Indian indices, Global indices,
+                                      Top Gainers, Top Losers
+  /api/markets/run  (admin manual) → All of the above on-demand
+
+Fallback chain (all data types):
+  Yahoo Finance → API-specific backup → Static fallback (never empty)
+
+  Crypto : Yahoo → CoinGecko → Static
+  Forex  : Yahoo → ExchangeRate-API → Static
+  Indices: Yahoo → Twelve Data → Static
+  Gainers: Yahoo → Twelve Data → Static (empty list)
+  Losers : Yahoo → Twelve Data → Static (empty list)
+
+Client refresh: useMarketData hook polls Supabase every 30 seconds
+
+----------------------------------------------------------------
+SECTION 2: ALL FIXES APPLIED (cumulative)
+----------------------------------------------------------------
+
+[FIX 1-11] Previous fixes (startup, admin, CSP, hydration etc.)
+  — see prior report for details
+
+[FIX 12-16] Previous fixes (null toFixed, font-src, mobile icon)
+  — see prior report for details
+
+[FIX 17] market-cron-fast — complete rewrite
+  File  : supabase/functions/market-cron-fast/index.ts
+  Before: Fetched crypto via CoinGecko, forex via ExchangeRate-API directly
+  After : Yahoo Finance primary for both crypto and forex
+          CoinGecko as crypto backup
+          ExchangeRate-API as forex backup
+          Static data as final fallback (never returns empty)
+          Circuit breaker resets on every successful Yahoo call
+          Schedule: every 1 minute (was every 5 min)
+
+[FIX 18] market-cron-slow — complete rewrite
+  File  : supabase/functions/market-cron-slow/index.ts
+  Before: Fetched all symbols from Yahoo with no fallback; silently
+          skipped on failure leaving DB stale
+  After : Yahoo Finance primary for all (50 NIFTY stocks + 15 Indian
+          indices + 16 global indices)
+          Twelve Data as backup for indices and gainers/losers
+          Static data as final fallback
+          All three groups fetched in parallel (faster execution)
+          Circuit breaker with reset on success
+          Schedule: every 5 minutes (was every 15 min)
+
+[FIX 19] /api/markets/run — upgraded to match cron fallback chain
+  File  : app/api/markets/run/route.ts
+  Before: CoinGecko/ExchangeRate-API as primary, no Twelve Data
+  After : Yahoo primary → API backup → static fallback
+          Matches exact same logic as edge functions
+          Covers all 6 data groups: crypto, forex, india indices,
+          global indices, gainers, losers
+
+[FIX 20] supabase/schema.sql — cron schedules activated
+  File  : supabase/schema.sql
+  Before: Cron schedules were commented out placeholders
+  After : Active cron.schedule() calls with correct intervals
+          market-cron-fast: '* * * * *'    (every 1 min)
+          market-cron-slow: '*/5 * * * *'  (every 5 min)
+          Uses CRON_SECRET for auth (not service-role-key)
+          Instructions included for updating existing schedules
+
+[FIX 21] netlify-plan-check — new edge function
+  File  : supabase/functions/netlify-plan-check/index.ts
+  Flow  :
+    Step 1 — POST without confirm body:
+      Calls Netlify accounts + usage API
+      Returns: credit balance, credits used, credits remaining,
+               deploys remaining this month, period dates
+      If credits < 30 (< 2 deploys): blocks build, returns warning
+      If credits >= 30: returns confirm_token (valid 5 min)
+
+    Step 2 — POST with { confirm: true, confirm_token: "<token>" }:
+      Validates token (must be from Step 1, not expired)
+      Triggers Netlify deploy hook
+      Logs deploy_id to Supabase logs table
+      Returns deploy confirmation
+
+  New env vars required:
+    NETLIFY_TOKEN             — personal access token from netlify.com/user/applications
+    NETLIFY_DEPLOY_HOOK_URL   — from Site config > Build & deploy > Build hooks
+
+[FIX 22] .env.local.example — updated with all required keys
+  Added: NETLIFY_TOKEN, NETLIFY_DEPLOY_HOOK_URL
+
+----------------------------------------------------------------
+SECTION 3: SUPABASE EDGE FUNCTION ENV VARS
+----------------------------------------------------------------
+
+These must be set in Supabase Dashboard → Project Settings → Edge Functions:
+
+  SUPABASE_URL              (auto-set by Supabase)
+  SUPABASE_SERVICE_ROLE_KEY (auto-set by Supabase)
+  TWELVE_DATA_API_KEY       = 3afe2e811a774c3084dc143c1161e60d
+  EXCHANGE_RATE_API_KEY     = 072097c3683dc4e15c11324e
+  CRON_SECRET               = 9d4e2f8a1c7b5e3d6a0f9c2b8e5d1a7f4c6b3e0d9a2f5c8b1e4d7a0f3c6b9e2d5
+  NETLIFY_TOKEN             = <your netlify personal access token>
+  NETLIFY_DEPLOY_HOOK_URL   = <your netlify deploy hook url>
+
+----------------------------------------------------------------
+SECTION 4: HOW TO DEPLOY EDGE FUNCTIONS
+----------------------------------------------------------------
+
+  cd supabase
+  supabase login
+  supabase link --project-ref prozmrjaqjskpadokves
+  supabase functions deploy market-cron-fast
+  supabase functions deploy market-cron-slow
+  supabase functions deploy netlify-plan-check
+
+Then run the cron schedule SQL in the Supabase SQL editor
+(after replacing <project-ref> and <cron-secret> placeholders).
+
+----------------------------------------------------------------
+SECTION 5: HOW TO USE netlify-plan-check
+----------------------------------------------------------------
+
+Step 1 — Check your credits:
+  curl -X POST \
+    https://prozmrjaqjskpadokves.supabase.co/functions/v1/netlify-plan-check \
+    -H "Authorization: Bearer <CRON_SECRET>"
+
+Response includes:
+  - credits remaining this billing period
+  - number of deploys you can still do (each = 15 credits)
+  - confirm_token (valid for 5 minutes)
+  - blocked message if credits < 30
+
+Step 2 — Trigger build (only if you want to proceed):
+  curl -X POST \
+    https://prozmrjaqjskpadokves.supabase.co/functions/v1/netlify-plan-check \
+    -H "Authorization: Bearer <CRON_SECRET>" \
+    -H "Content-Type: application/json" \
+    -d '{"confirm": true, "confirm_token": "<token from step 1>"}'
+
+----------------------------------------------------------------
+SECTION 6: SUPABASE FREE TIER USAGE ESTIMATE
+----------------------------------------------------------------
+
+  market-cron-fast : 1/min  × 60 × 24 × 30 = 43,200/month
+  market-cron-slow : 1/5min × 12 × 24 × 30 =  8,640/month
+  netlify-check    : manual only             ~     10/month
+  ─────────────────────────────────────────────────────────
+  Total estimated  :                         ~51,850/month
+  Free tier limit  :                         500,000/month
+  Usage            :                         ~10.4% of free tier
+
+----------------------------------------------------------------
+SECTION 7: NETLIFY FREE TIER CREDIT BUDGET
+----------------------------------------------------------------
+
+  Monthly credits    : 300
+  Per deploy cost    : 15 credits
+  Max deploys/month  : 20
+  netlify-plan-check will block build if < 30 credits remain
+  (protecting a minimum 2-deploy buffer at all times)
+
+----------------------------------------------------------------
+SECTION 8: REMAINING TODOs
+----------------------------------------------------------------
+
+[TODO 1] Set NETLIFY_TOKEN and NETLIFY_DEPLOY_HOOK_URL in Supabase Edge Function env vars
+[TODO 2] Replace <project-ref> and <cron-secret> in schema.sql cron schedules
+[TODO 3] Deploy all 3 edge functions via Supabase CLI
+[TODO 4] Run cron schedule SQL in Supabase SQL editor
+[TODO 5] Re-enable admin auth in middleware.ts and app/admin/layout.tsx before production
+[TODO 6] Confirm Supabase tables exist (run schema.sql if fresh project)
+[TODO 7] Create admin user in Supabase Auth + set role = 'admin' in public.users
+[TODO 8] Deploy ImageKit /tradeghost folder or update upload path
+[TODO 9] Set NEXT_PUBLIC_APP_URL to final production domain
+
+================================================================
